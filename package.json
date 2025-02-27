@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "@distube/ytdl-core": "^1.6.4",
+    "@distube/ytdl-core": "^4.16.4",
     "cors": "^2.8.5"
   }
 }
