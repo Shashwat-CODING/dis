@@ -1,0 +1,14 @@
+{
+  "name": "ytdl-backend",
+  "version": "1.0.0",
+  "description": "YouTube Audio Stream API",
+  "main": "api/server.js",
+  "scripts": {
+    "start": "node api/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "@distube/ytdl-core": "^1.6.4",
+    "cors": "^2.8.5"
+  }
+}
