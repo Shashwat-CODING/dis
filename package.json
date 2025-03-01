@@ -9,8 +9,6 @@
   "dependencies": {
     "express": "^4.18.2",
     "@distube/ytdl-core": "^4.16.4",
-    "cors": "^2.8.5",
-    "puppeteer-core": "^21.3.8",
-    "chromium": "^112.0.0"
+    "cors": "^2.8.5"
   }
 }
