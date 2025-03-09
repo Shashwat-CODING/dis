@@ -1,100 +1,141 @@
 const express = require("express");
-const ytdl = require("@distube/ytdl-core");
+const { google } = require("googleapis");
 const cors = require("cors");
-const fs = require("fs");
-const path = require("path");
+const session = require("express-session");
+const ytdl = require("@distube/ytdl-core");
+
 const app = express();
 const PORT = 3100;
 
+// OAuth Credentials (Keep these secure)
+const CLIENT_ID = "1023316916513-0ceeamcb82h4c5j27p7pnrbq0fl9udhd.apps.googleusercontent.com";
+const CLIENT_SECRET = "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";
+const REDIRECT_URI = "http://localhost:3100/oauth2callback"; // Change this when deploying to Render
+
+// Configure OAuth2 client
+const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+
+// YouTube API client
+const youtube = google.youtube({
+  version: "v3",
+  auth: oauth2Client
+});
+
+// Middleware
 app.use(cors());
+app.use(express.json());
+app.use(
+  session({
+    secret: "youtube_api_session_secret",
+    resave: false,
+    saveUninitialized: true,
+    cookie: { secure: false }
+  })
+);
 
-// Path to cookies file
-const cookiesFilePath = path.join(__dirname, "cookies.txt");
+// Generate authentication URL
+app.get("/auth", (req, res) => {
+  const authUrl = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    scope: ["https://www.googleapis.com/auth/youtube.readonly"]
+  });
+  res.redirect(authUrl);
+});
 
-// Function to parse Netscape format cookies into JSON format
-function parseNetscapeCookies(cookieContent) {
-  const cookies = [];
+// OAuth callback handler
+app.get("/oauth2callback", async (req, res) => {
+  const { code } = req.query;
   
-  // Split the content by lines and process each line
-  const lines = cookieContent.split('\n');
-  
-  for (const line of lines) {
-    // Skip comments and empty lines
-    if (line.startsWith('#') || line.trim() === '') {
-      continue;
-    }
-    
-    // Split the line by tabs
-    const parts = line.split('\t');
-    
-    // Ensure we have enough parts
-    if (parts.length >= 7) {
-      const domain = parts[0];
-      const path = parts[2];
-      const secure = parts[3] === 'TRUE';
-      const expirationDate = parseInt(parts[4]);
-      const name = parts[5];
-      const value = parts[6];
-      
-      cookies.push({
-        name,
-        value,
-        domain,
-        path,
-        expirationDate,
-        secure,
-        httpOnly: false // Not specified in Netscape format, default to false
-      });
-    }
-  }
-  
-  return cookies;
-}
-
-app.get("/streams/:videoId", async (req, res) => {
-  const videoId = req.params.videoId;
-  if (!videoId) {
-    return res.status(400).json({ error: "Missing video ID" });
-  }
-
   try {
-    const url = `https://www.youtube.com/watch?v=${videoId}`;
+    // Exchange code for tokens
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
     
-    // Read and parse cookies
-    let cookies = [];
-    if (fs.existsSync(cookiesFilePath)) {
-      const cookiesContent = fs.readFileSync(cookiesFilePath, "utf8");
-      cookies = parseNetscapeCookies(cookiesContent);
-    } else {
-      console.warn("cookies.txt file not found");
+    // Store tokens in session
+    req.session.tokens = tokens;
+    
+    res.redirect("/auth-success");
+  } catch (error) {
+    console.error("OAuth error:", error);
+    res.status(500).send("Authentication failed");
+  }
+});
+
+// Auth success page
+app.get("/auth-success", (req, res) => {
+  res.send("Authentication successful! You can now use the API.");
+});
+
+// Get audio stream URL
+app.get("/streams/:videoId", async (req, res) => {
+  const { videoId } = req.params;
+  
+  if (!req.session.tokens) {
+    return res.status(401).json({ 
+      error: "Not authenticated", 
+      authUrl: "/auth" 
+    });
+  }
+  
+  try {
+    oauth2Client.setCredentials(req.session.tokens);
+    
+    // Get video details
+    const videoResponse = await youtube.videos.list({
+      part: "snippet,contentDetails",
+      id: videoId
+    });
+    
+    if (!videoResponse.data.items || videoResponse.data.items.length === 0) {
+      return res.status(404).json({ error: "Video not found" });
     }
     
-    // Set options with cookies in the new format
-    const options = {
+    const videoDetails = videoResponse.data.items[0];
+    const title = videoDetails.snippet.title;
+    
+    // Fetch audio stream using ytdl-core
+    const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
       requestOptions: {
-        // The new format requires an array of cookie objects
-        cookies: cookies
+        headers: {
+          "Authorization": `Bearer ${req.session.tokens.access_token}`
+        }
       }
-    };
-
-    // Get video info with cookies
-    const info = await ytdl.getInfo(url, options);
+    });
+    
     const audioFormats = ytdl.filterFormats(info.formats, "audioonly");
     
     if (audioFormats.length > 0) {
       return res.json({
         audioUrl: audioFormats[0].url,
-        title: info.videoDetails.title,
+        title: title
       });
     } else {
       return res.status(404).json({ error: "No audio streams found" });
     }
+    
   } catch (error) {
-    console.error("Error fetching audio:", error);
+    console.error("Error fetching video:", error);
+    
+    if (error.message.includes("invalid_grant") || error.message.includes("token expired")) {
+      if (req.session.tokens.refresh_token) {
+        try {
+          const { tokens } = await oauth2Client.refreshToken(req.session.tokens.refresh_token);
+          req.session.tokens = tokens;
+          return res.status(401).json({ error: "Token refreshed, please try again" });
+        } catch (refreshError) {
+          return res.status(401).json({ error: "Authentication expired", authUrl: "/auth" });
+        }
+      } else {
+        return res.status(401).json({ error: "Authentication expired", authUrl: "/auth" });
+      }
+    }
+    
     return res.status(500).json({ error: "Failed to fetch audio" });
   }
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Visit http://localhost:${PORT}/auth to authenticate`);
 });
