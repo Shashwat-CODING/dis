@@ -6,9 +6,11 @@
   "scripts": {
     "start": "node api/server.js"
   },
-  "dependencies": {
-    "express": "^4.18.2",
-    "@distube/ytdl-core": "^4.16.4",
-    "cors": "^2.8.5"
-  }
+ "dependencies": {
+  "express": "^4.18.2",
+  "@distube/ytdl-core": "^4.16.4",
+  "cors": "^2.8.5",
+  "googleapis": "^118.0.0",
+  "express-session": "^1.17.3"
+}
 }
