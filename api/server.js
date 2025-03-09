@@ -8,23 +8,47 @@ const PORT = 3100;
 
 app.use(cors());
 
-// Configure ytdl to use cookies
+// Path to cookies file
 const cookiesFilePath = path.join(__dirname, "cookies.txt");
 
-// Function to read cookies from file
-function getCookiesFromFile() {
-  try {
-    if (fs.existsSync(cookiesFilePath)) {
-      const cookiesContent = fs.readFileSync(cookiesFilePath, "utf8");
-      return cookiesContent;
-    } else {
-      console.warn("cookies.txt file not found");
-      return "";
+// Function to parse Netscape format cookies into JSON format
+function parseNetscapeCookies(cookieContent) {
+  const cookies = [];
+  
+  // Split the content by lines and process each line
+  const lines = cookieContent.split('\n');
+  
+  for (const line of lines) {
+    // Skip comments and empty lines
+    if (line.startsWith('#') || line.trim() === '') {
+      continue;
     }
-  } catch (error) {
-    console.error("Error reading cookies file:", error);
-    return "";
+    
+    // Split the line by tabs
+    const parts = line.split('\t');
+    
+    // Ensure we have enough parts
+    if (parts.length >= 7) {
+      const domain = parts[0];
+      const path = parts[2];
+      const secure = parts[3] === 'TRUE';
+      const expirationDate = parseInt(parts[4]);
+      const name = parts[5];
+      const value = parts[6];
+      
+      cookies.push({
+        name,
+        value,
+        domain,
+        path,
+        expirationDate,
+        secure,
+        httpOnly: false // Not specified in Netscape format, default to false
+      });
+    }
   }
+  
+  return cookies;
 }
 
 app.get("/streams/:videoId", async (req, res) => {
@@ -35,15 +59,21 @@ app.get("/streams/:videoId", async (req, res) => {
 
   try {
     const url = `https://www.youtube.com/watch?v=${videoId}`;
-    // Get cookies from file
-    const cookiesContent = getCookiesFromFile();
     
-    // Set options with cookies
+    // Read and parse cookies
+    let cookies = [];
+    if (fs.existsSync(cookiesFilePath)) {
+      const cookiesContent = fs.readFileSync(cookiesFilePath, "utf8");
+      cookies = parseNetscapeCookies(cookiesContent);
+    } else {
+      console.warn("cookies.txt file not found");
+    }
+    
+    // Set options with cookies in the new format
     const options = {
       requestOptions: {
-        headers: {
-          cookie: cookiesContent
-        }
+        // The new format requires an array of cookie objects
+        cookies: cookies
       }
     };
 
