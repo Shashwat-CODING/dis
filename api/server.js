@@ -7,10 +7,10 @@ const ytdl = require("@distube/ytdl-core");
 const app = express();
 const PORT = 3100;
 
-// OAuth Credentials (Keep these secure)
+// OAuth Credentials
 const CLIENT_ID = "1023316916513-0ceeamcb82h4c5j27p7pnrbq0fl9udhd.apps.googleusercontent.com";
 const CLIENT_SECRET = "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";
-const REDIRECT_URI = "http://localhost:3100/oauth2callback"; // Change this when deploying to Render
+const REDIRECT_URI = "http://localhost:3100/oauth2callback"; // Change this when deploying
 
 // Configure OAuth2 client
 const oauth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
@@ -33,66 +33,42 @@ app.use(
   })
 );
 
-// Generate authentication URL
-app.get("/auth", (req, res) => {
-  const authUrl = oauth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope: ["https://www.googleapis.com/auth/youtube.readonly"]
-  });
-  res.redirect(authUrl);
-});
-
-// OAuth callback handler
-app.get("/oauth2callback", async (req, res) => {
-  const { code } = req.query;
-  
-  try {
-    // Exchange code for tokens
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
-    
-    // Store tokens in session
-    req.session.tokens = tokens;
-    
-    res.redirect("/auth-success");
-  } catch (error) {
-    console.error("OAuth error:", error);
-    res.status(500).send("Authentication failed");
+// Ensure tokens are refreshed before making API calls
+async function ensureAuthenticated(req) {
+  if (!req.session.tokens) {
+    throw new Error("Not authenticated");
   }
-});
 
-// Auth success page
-app.get("/auth-success", (req, res) => {
-  res.send("Authentication successful! You can now use the API.");
-});
+  oauth2Client.setCredentials(req.session.tokens);
 
-// Get audio stream URL
+  // Refresh the token if it's expired
+  if (oauth2Client.isTokenExpiring()) {
+    const { credentials } = await oauth2Client.refreshAccessToken();
+    req.session.tokens = credentials;
+    oauth2Client.setCredentials(credentials);
+  }
+}
+
+// Get audio stream URL (Uses OAuth properly)
 app.get("/streams/:videoId", async (req, res) => {
   const { videoId } = req.params;
-  
-  if (!req.session.tokens) {
-    return res.status(401).json({ 
-      error: "Not authenticated", 
-      authUrl: "/auth" 
-    });
-  }
-  
+
   try {
-    oauth2Client.setCredentials(req.session.tokens);
-    
+    await ensureAuthenticated(req); // Ensure OAuth token is valid
+
     // Get video details
     const videoResponse = await youtube.videos.list({
-      part: "snippet,contentDetails",
+      part: "snippet",
       id: videoId
     });
-    
-    if (!videoResponse.data.items || videoResponse.data.items.length === 0) {
+
+    if (!videoResponse.data.items.length) {
       return res.status(404).json({ error: "Video not found" });
     }
-    
+
     const videoDetails = videoResponse.data.items[0];
     const title = videoDetails.snippet.title;
-    
+
     // Fetch audio stream using ytdl-core
     const info = await ytdl.getInfo(`https://www.youtube.com/watch?v=${videoId}`, {
       requestOptions: {
@@ -101,9 +77,9 @@ app.get("/streams/:videoId", async (req, res) => {
         }
       }
     });
-    
+
     const audioFormats = ytdl.filterFormats(info.formats, "audioonly");
-    
+
     if (audioFormats.length > 0) {
       return res.json({
         audioUrl: audioFormats[0].url,
@@ -112,24 +88,18 @@ app.get("/streams/:videoId", async (req, res) => {
     } else {
       return res.status(404).json({ error: "No audio streams found" });
     }
-    
+
   } catch (error) {
     console.error("Error fetching video:", error);
-    
-    if (error.message.includes("invalid_grant") || error.message.includes("token expired")) {
-      if (req.session.tokens.refresh_token) {
-        try {
-          const { tokens } = await oauth2Client.refreshToken(req.session.tokens.refresh_token);
-          req.session.tokens = tokens;
-          return res.status(401).json({ error: "Token refreshed, please try again" });
-        } catch (refreshError) {
-          return res.status(401).json({ error: "Authentication expired", authUrl: "/auth" });
-        }
-      } else {
-        return res.status(401).json({ error: "Authentication expired", authUrl: "/auth" });
-      }
+
+    if (error.message.includes("Not authenticated")) {
+      return res.status(401).json({ error: "Not authenticated, login required" });
     }
-    
+
+    if (error.message.includes("quota")) {
+      return res.status(429).json({ error: "YouTube API quota exceeded" });
+    }
+
     return res.status(500).json({ error: "Failed to fetch audio" });
   }
 });
@@ -137,5 +107,4 @@ app.get("/streams/:videoId", async (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Visit http://localhost:${PORT}/auth to authenticate`);
 });
