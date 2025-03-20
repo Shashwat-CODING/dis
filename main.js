@@ -138,7 +138,8 @@ async function fetchVideoInfo(videoId, maxRetries = proxyList.length) {
       
       // Add proxy if available
       if (proxyAgent) {
-        options.requestOptions.agent = proxyAgent;
+        // Use 'client' property instead of 'agent'
+        options.requestOptions.client = { agent: proxyAgent };
       }
       
       // Fetch video information
@@ -313,7 +314,8 @@ app.get("/stream/:videoId", async (req, res) => {
     
     // Add proxy if available
     if (proxyAgent) {
-      options.requestOptions.agent = proxyAgent;
+      // Use 'client' property instead of 'agent'
+      options.requestOptions.client = { agent: proxyAgent };
       console.log(`Streaming using proxy: ${proxy}`);
     }
     
