@@ -2,13 +2,13 @@
   "name": "ytdl-backend",
   "version": "1.0.0",
   "description": "YouTube Audio Stream API",
-  "main": "api/server.js",
+  "main": "main.js",
   "scripts": {
-    "start": "node api/server.js"
+    "start": "node main.js"
   },
  "dependencies": {
   "express": "^4.18.2",
-  "@distube/ytdl-core": "^4.16.4",
+  "@distube/ytdl-core": "^4.16.5",
   "cors": "^2.8.5",
   "googleapis": "^118.0.0",
   "express-session": "^1.17.3"
