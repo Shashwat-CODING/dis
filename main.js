@@ -3,6 +3,7 @@ const ytdl = require("@distube/ytdl-core");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const rateLimit = require("express-rate-limit");
 
 // Disable update checks for faster startup
 process.env.YTDL_NO_UPDATE = 'true';
@@ -14,6 +15,17 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+// Add rate limiting to prevent overwhelming YouTube's servers
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 20, // limit each IP to 20 requests per windowMs
+  message: { error: "Too many requests from this IP, please try again later" }
+});
+
+// Apply rate limiting to the video endpoints
+app.use("/mp3", apiLimiter);
+app.use("/stream", apiLimiter);
 
 // Improved cache with longer TTL and prefetching
 const videoCache = new Map();
@@ -62,9 +74,18 @@ try {
   console.error("Failed to load cookies at startup:", error);
 }
 
-// Pre-create request options for reuse
+// Enhanced base options with proper headers to avoid detection
 const getBaseOptions = () => ({
-  requestOptions: cookies.length > 0 ? { cookies } : {}
+  requestOptions: {
+    cookies: cookies.length > 0 ? cookies : undefined,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://music.youtube.com/',
+      'Origin': 'https://music.youtube.com'
+    }
+  }
 });
 
 // Cleanup old cache entries
@@ -93,7 +114,27 @@ function cleanupCache() {
   }
 }
 
-// Optimized video info fetching with enhanced caching
+// Add retry logic for fetching video info
+async function fetchWithRetry(videoId, maxRetries = 3) {
+  let retries = 0;
+  while (retries < maxRetries) {
+    try {
+      const options = getBaseOptions();
+      return await ytdl.getInfo(`https://music.youtube.com/watch?v=${videoId}`, options);
+    } catch (error) {
+      if ((error.statusCode === 429 || error.message?.includes('too many requests')) && retries < maxRetries - 1) {
+        const delay = Math.pow(2, retries) * 1000; // Exponential backoff
+        console.log(`Rate limited for ${videoId}, retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        retries++;
+      } else {
+        throw error;
+      }
+    }
+  }
+}
+
+// Optimized video info fetching with enhanced caching and retry logic
 async function getCachedVideoInfo(videoId) {
   const cacheKey = videoId;
   
@@ -105,8 +146,7 @@ async function getCachedVideoInfo(videoId) {
     videoCache.delete(cacheKey);
   }
   
-  const options = getBaseOptions();
-  const info = await ytdl.getInfo(`https://youtube.com/watch?v=${videoId}`, options);
+  const info = await fetchWithRetry(videoId);
   
   videoCache.set(cacheKey, {
     info,
@@ -161,6 +201,35 @@ function isReliableFormat(format) {
   );
 }
 
+// Add throttling to request queue
+const requestQueue = [];
+let isProcessing = false;
+const THROTTLE_DELAY = 500; // ms between requests
+
+async function processQueue() {
+  if (isProcessing || requestQueue.length === 0) return;
+  
+  isProcessing = true;
+  const { task, resolve, reject } = requestQueue.shift();
+  
+  try {
+    const result = await task();
+    resolve(result);
+  } catch (error) {
+    reject(error);
+  } finally {
+    isProcessing = false;
+    setTimeout(processQueue, THROTTLE_DELAY);
+  }
+}
+
+function addToQueue(task) {
+  return new Promise((resolve, reject) => {
+    requestQueue.push({ task, resolve, reject });
+    if (!isProcessing) processQueue();
+  });
+}
+
 // MP3 info endpoint with more reliable audio streams
 app.get("/mp3/:videoId", async (req, res) => {
   const videoId = req.params.videoId;
@@ -169,8 +238,8 @@ app.get("/mp3/:videoId", async (req, res) => {
   }
 
   try {
-    // Fetch video info with caching
-    const info = await getCachedVideoInfo(videoId);
+    // Add the request to the queue to throttle
+    const info = await addToQueue(() => getCachedVideoInfo(videoId));
     
     // Get all possible audio formats
     const regularAudioFormats = info.formats
@@ -227,11 +296,11 @@ app.get("/mp3/:videoId", async (req, res) => {
   } catch (error) {
     console.error("MP3 info error:", error.message);
     if (error.message?.includes('sign in')) {
-      res.status(401).json({ error: "Authentication required" });
-    } else if (error.statusCode === 429) {
-      res.status(429).json({ error: "Rate limited" });
+      res.status(401).json({ error: "Authentication required - check your cookies" });
+    } else if (error.statusCode === 429 || error.message?.includes('too many requests')) {
+      res.status(429).json({ error: "Rate limited by YouTube - try again later" });
     } else {
-      res.status(500).json({ error: "Failed to fetch audio data" });
+      res.status(500).json({ error: "Failed to fetch audio data: " + error.message });
     }
   }
 });
@@ -244,8 +313,8 @@ app.get("/stream/:videoId", async (req, res) => {
   }
 
   try {
-    // Use caching for format info
-    const info = await getCachedVideoInfo(videoId);
+    // Use caching for format info with throttling
+    const info = await addToQueue(() => getCachedVideoInfo(videoId));
     const audioFormat = getBestAudioFormat(info, videoId);
     
     if (!audioFormat) {
@@ -266,13 +335,20 @@ app.get("/stream/:videoId", async (req, res) => {
     };
     
     // Stream directly to response
-    const stream = ytdl(`https://youtube.com/watch?v=${videoId}`, options);
+    const stream = ytdl(`https://music.youtube.com/watch?v=${videoId}`, options);
     
     // Handle errors in the stream
     stream.on('error', (err) => {
       console.error(`Stream error for ${videoId}:`, err.message);
       if (!res.headersSent) {
-        res.status(500).json({ error: "Streaming error" });
+        res.status(500).json({ error: "Streaming error: " + err.message });
+      }
+    });
+    
+    // Add more comprehensive error handling for streams
+    stream.on('response', (response) => {
+      if (response.statusCode >= 400) {
+        console.warn(`Stream received HTTP ${response.statusCode} for ${videoId}`);
       }
     });
     
@@ -281,27 +357,52 @@ app.get("/stream/:videoId", async (req, res) => {
   } catch (error) {
     console.error("Stream error:", error.message);
     if (error.message?.includes('sign in')) {
-      res.status(401).json({ error: "Authentication required" });
-    } else if (error.statusCode === 429) {
-      res.status(429).json({ error: "Rate limited" });
+      res.status(401).json({ error: "Authentication required - check your cookies" });
+    } else if (error.statusCode === 429 || error.message?.includes('too many requests')) {
+      res.status(429).json({ error: "Rate limited by YouTube - try again later" });
     } else {
-      res.status(500).json({ error: "Failed to stream audio" });
+      res.status(500).json({ error: "Failed to stream audio: " + error.message });
     }
   }
 });
 
-// Fast health check endpoint
+// Fast health check endpoint with more diagnostics
 app.get("/health", (req, res) => {
+  // Check cookie expiration
+  const now = Date.now();
+  const validCookies = cookies.filter(cookie => !cookie.expires || cookie.expires > now/1000);
+  
   res.json({ 
     status: "OK", 
     cookiesLoaded: cookies.length > 0,
     cookieCount: cookies.length,
-    cacheSize: videoCache.size
+    validCookieCount: validCookies.length,
+    cacheSize: videoCache.size,
+    formatCacheSize: formatCache.size,
+    queueSize: requestQueue.length,
+    isProcessingQueue: isProcessing,
+    uptime: process.uptime()
   });
 });
+
+// Check cookies validity periodically
+function checkCookiesValidity() {
+  const now = Date.now() / 1000; // Convert to seconds for comparison with cookie expiry
+  const expiredCookies = cookies.filter(cookie => cookie.expires && cookie.expires <= now);
+  
+  if (expiredCookies.length > 0) {
+    console.warn(`Warning: ${expiredCookies.length} cookies have expired. Consider updating your cookies.txt file.`);
+  }
+}
 
 // Initialize the server with optimizations
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Cookies: ${cookies.length > 0 ? `${cookies.length} loaded` : 'None'}`);
+  
+  // Check cookies validity on startup
+  checkCookiesValidity();
+  
+  // Schedule periodic checks for cookie validity
+  setInterval(checkCookiesValidity, 3600000); // Check every hour
 });
