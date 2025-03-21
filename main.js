@@ -3,82 +3,41 @@ const ytdl = require("@distube/ytdl-core");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
-const axios = require("axios");
-const HttpsProxyAgent = require("https-proxy-agent").HttpsProxyAgent;
 
-// Set environment variable to disable update checks
+// Disable update checks for faster startup
 process.env.YTDL_NO_UPDATE = 'true';
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
+// Performance optimizations
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-// Cache for video info
+// Improved cache with longer TTL and prefetching
 const videoCache = new Map();
-const CACHE_TTL = 3600000; // 1 hour in milliseconds
+const formatCache = new Map();
+const CACHE_TTL = 24 * 3600000; // 24 hours
+const MAX_CACHE_SIZE = 1000;
 
-// Proxy management
-const PROXY_API_URL = "https://backendmix.vercel.app/ips";
-let proxyList = [];
-let currentProxyIndex = 0;
-let lastProxyRefresh = 0;
-const PROXY_REFRESH_INTERVAL = 30 * 60 * 1000; // 30 minutes
+// Load cookies only once at startup
+const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+let cookies = [];
 
-// Function to fetch proxy list
-async function refreshProxyList() {
-  try {
-    const now = Date.now();
-    if (now - lastProxyRefresh > PROXY_REFRESH_INTERVAL || proxyList.length === 0) {
-      console.log("Refreshing proxy list...");
-      const response = await axios.get(PROXY_API_URL);
-      if (response.data && Array.isArray(response.data.proxies) && response.data.proxies.length > 0) {
-        proxyList = response.data.proxies;
-        currentProxyIndex = 0;
-        lastProxyRefresh = now;
-        console.log(`Successfully loaded ${proxyList.length} proxies`);
-      } else {
-        console.error("Invalid proxy list format received");
-      }
-    }
-  } catch (error) {
-    console.error("Failed to refresh proxy list:", error.message);
-  }
-}
-
-// Get the next proxy from the list
-function getNextProxy() {
-  if (proxyList.length === 0) return null;
-  
-  const proxy = proxyList[currentProxyIndex];
-  currentProxyIndex = (currentProxyIndex + 1) % proxyList.length;
-  return proxy;
-}
-
-// Create a proxy agent for HTTP/HTTPS requests
-function createProxyAgent(proxy) {
-  if (!proxy) return null;
-  return new HttpsProxyAgent(`http://${proxy}`);
-}
-
-// Function to parse Netscape cookies.txt format
+// Parse cookies from file - optimized version
 function parseCookiesFile(filePath) {
   try {
     const cookiesContent = fs.readFileSync(filePath, 'utf8');
-    const cookieLines = cookiesContent.split('\n');
+    if (!cookiesContent.trim()) return [];
     
-    const cookies = [];
-    
-    for (const line of cookieLines) {
-      // Skip comments and empty lines
-      if (line.startsWith('#') || line.trim() === '') continue;
-      
-      // Parse each cookie line
-      const parts = line.split('\t');
-      if (parts.length >= 7) {
-        // Format for new ytdl-core cookie structure
-        cookies.push({
+    return cookiesContent.split('\n')
+      .filter(line => line.trim() && !line.startsWith('#'))
+      .map(line => {
+        const parts = line.split('\t');
+        if (parts.length < 7) return null;
+        
+        return {
           name: parts[5],
           value: parts[6],
           domain: parts[0],
@@ -86,20 +45,14 @@ function parseCookiesFile(filePath) {
           expires: parseInt(parts[4]),
           httpOnly: false,
           secure: parts[3] === 'TRUE'
-        });
-      }
-    }
-    
-    return cookies;
+        };
+      })
+      .filter(Boolean);
   } catch (error) {
     console.error("Error parsing cookies file:", error);
     return [];
   }
 }
-
-// Load cookies from file
-const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
-let cookies = [];
 
 // Try to load cookies at startup
 try {
@@ -109,183 +62,191 @@ try {
   console.error("Failed to load cookies at startup:", error);
 }
 
-// Fetch video info with proxy rotation and retries
-async function fetchVideoInfo(videoId, maxRetries = proxyList.length) {
-  let attempts = 0;
-  let lastError = null;
-  
-  // Ensure proxy list is loaded
-  if (proxyList.length === 0) {
-    await refreshProxyList();
-  }
-  
-  while (attempts < maxRetries) {
-    const proxy = getNextProxy();
-    const proxyAgent = createProxyAgent(proxy);
+// Pre-create request options for reuse
+const getBaseOptions = () => ({
+  requestOptions: cookies.length > 0 ? { cookies } : {}
+});
+
+// Cleanup old cache entries
+function cleanupCache() {
+  if (videoCache.size > MAX_CACHE_SIZE) {
+    const now = Date.now();
+    let oldestTime = now;
+    let oldestKey = null;
     
-    console.log(`Attempt ${attempts + 1}/${maxRetries} using proxy: ${proxy}`);
-    
-    try {
-      // Options for ytdl-core with authentication cookies and proxy
-      const options = {
-        requestOptions: {}
-      };
+    while (videoCache.size > MAX_CACHE_SIZE * 0.8) {
+      videoCache.forEach((value, key) => {
+        if (value.timestamp < oldestTime) {
+          oldestTime = value.timestamp;
+          oldestKey = key;
+        }
+      });
       
-      // Add cookies if available
-      if (cookies.length > 0) {
-        options.requestOptions.cookies = cookies;
-      }
-      
-      // Add proxy if available
-      if (proxyAgent) {
-        // Use 'client' property instead of 'agent'
-        options.requestOptions.client = { agent: proxyAgent };
-      }
-      
-      // Fetch video information
-      return await ytdl.getInfo(`https://music.youtube.com/watch?v=${videoId}`, options);
-    } catch (error) {
-      lastError = error;
-      
-      // If it's a rate limit error, try another proxy
-      if (error.statusCode === 429) {
-        console.log(`Rate limit hit with proxy ${proxy}, trying next proxy...`);
-        attempts++;
-        // Small delay before trying next proxy
-        await new Promise(resolve => setTimeout(resolve, 500));
-      } else if (error.statusCode === 403 || error.statusCode === 401) {
-        // Authentication error - cookie issue, don't retry with different proxy
-        console.error("Authentication error:", error.message);
-        throw error;
+      if (oldestKey) {
+        videoCache.delete(oldestKey);
+        oldestKey = null;
+        oldestTime = now;
       } else {
-        // Other errors, try next proxy
-        console.error(`Error with proxy ${proxy}:`, error.message);
-        attempts++;
-        await new Promise(resolve => setTimeout(resolve, 500));
+        break;
       }
     }
   }
-  
-  // If we've exhausted all proxies without success
-  console.error(`Failed after ${attempts} attempts with different proxies`);
-  throw lastError || new Error("Failed to fetch video info after multiple attempts");
 }
 
-// Helper function to get video info with caching and proxy rotation
+// Optimized video info fetching with enhanced caching
 async function getCachedVideoInfo(videoId) {
   const cacheKey = videoId;
   
-  // Check if we have a valid cache entry
   if (videoCache.has(cacheKey)) {
     const cachedData = videoCache.get(cacheKey);
-    // Check if cache is still valid
     if (Date.now() - cachedData.timestamp < CACHE_TTL) {
       return cachedData.info;
     }
-    // Cache expired, remove it
     videoCache.delete(cacheKey);
   }
   
-  // Fetch fresh data with proxy rotation
-  const info = await fetchVideoInfo(videoId);
+  const options = getBaseOptions();
+  const info = await ytdl.getInfo(`https://youtube.com/watch?v=${videoId}`, options);
   
-  // Store in cache
   videoCache.set(cacheKey, {
     info,
     timestamp: Date.now()
   });
   
+  if (videoCache.size > MAX_CACHE_SIZE) {
+    cleanupCache();
+  }
+  
   return info;
 }
 
-// Reload cookies endpoint
-app.post("/reload-cookies", (req, res) => {
-  try {
-    cookies = parseCookiesFile(COOKIES_PATH);
-    res.json({ success: true, message: `Reloaded ${cookies.length} cookies` });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to reload cookies" });
-  }
-});
-
-// Refresh proxies endpoint
-app.post("/refresh-proxies", async (req, res) => {
-  try {
-    await refreshProxyList();
-    res.json({ 
-      success: true, 
-      message: `Refreshed proxy list`, 
-      count: proxyList.length,
-      proxies: proxyList
-    });
-  } catch (error) {
-    res.status(500).json({ error: "Failed to refresh proxies" });
-  }
-});
-
-// Health check endpoint
-app.get("/health", (req, res) => {
-  res.json({ 
-    status: "OK", 
-    cookiesLoaded: cookies.length > 0,
-    cookieCount: cookies.length,
-    proxiesLoaded: proxyList.length > 0,
-    proxyCount: proxyList.length
-  });
-});
-
-// MP3 info endpoint
-app.get("/mp3/:videoId", async (req, res) => {
-  try {
-    const videoId = req.params.videoId;
-    if (!videoId) {
-      return res.status(400).json({ error: "Missing video ID" });
+// Find the best audio format and cache the decision
+function getBestAudioFormat(info, videoId) {
+  const formatCacheKey = videoId;
+  
+  if (formatCache.has(formatCacheKey)) {
+    const format = formatCache.get(formatCacheKey);
+    const now = Date.now();
+    
+    if (now - format.timestamp < CACHE_TTL) {
+      return format.audioFormat;
     }
+    formatCache.delete(formatCacheKey);
+  }
+  
+  const audioFormat = ytdl.chooseFormat(info.formats, { 
+    quality: 'highestaudio', 
+    filter: 'audioonly' 
+  });
+  
+  if (audioFormat) {
+    formatCache.set(formatCacheKey, {
+      audioFormat,
+      timestamp: Date.now()
+    });
+  }
+  
+  return audioFormat;
+}
 
-    // Fetch video information with caching and proxy rotation
+// Helper function to check if a format is likely to work reliably
+function isReliableFormat(format) {
+  // Check if format has crucial properties that make it more likely to be playable
+  return (
+    format &&
+    format.url && 
+    format.contentLength && 
+    !format.isHLS && // HLS streams tend to be less reliable
+    !format.isDashMPD // DASH manifests need additional processing
+  );
+}
+
+// MP3 info endpoint with more reliable audio streams
+app.get("/mp3/:videoId", async (req, res) => {
+  const videoId = req.params.videoId;
+  if (!videoId) {
+    return res.status(400).json({ error: "Missing video ID" });
+  }
+
+  try {
+    // Fetch video info with caching
     const info = await getCachedVideoInfo(videoId);
+    
+    // Get all possible audio formats
+    const regularAudioFormats = info.formats
+      .filter(format => format.mimeType?.includes("audio") && format.audioCodec)
+      .map(format => ({
+        ...format,
+        formatType: "regular",
+        isReliable: isReliableFormat(format)
+      }));
+    
+    // Get adaptive formats if available
+    const adaptiveAudioFormats = info.player_response?.streamingData?.adaptiveFormats
+      ? info.player_response.streamingData.adaptiveFormats
+          .filter(format => format.mimeType?.includes("audio") || 
+                           (format.audioQuality && !format.qualityLabel))
+          .map(format => ({
+            ...format,
+            formatType: "adaptive",
+            isReliable: isReliableFormat(format)
+          }))
+      : [];
+    
+    // Combine and sort formats by reliability first, then by bitrate
+    const allAudioFormats = [...regularAudioFormats, ...adaptiveAudioFormats]
+      .sort((a, b) => {
+        // First sort by reliability
+        if (a.isReliable && !b.isReliable) return -1;
+        if (!a.isReliable && b.isReliable) return 1;
+        
+        // Then sort by bitrate (higher first)
+        return (b.bitrate || 0) - (a.bitrate || 0);
+      });
 
-    // Filter formats for audio-only streams
-    const audioFormats = info.formats.filter(format => 
-      format.mimeType?.includes("audio") && format.audioCodec
-    );
-
-    if (audioFormats.length === 0) {
+    if (allAudioFormats.length === 0) {
       return res.status(404).json({ error: "No audio stream found" });
     }
 
+    // Get recommended format
+    const recommendedFormat = allAudioFormats.find(format => format.isReliable) || allAudioFormats[0];
+
+    // Return audio data
     res.json({
-      videoDetails: info.videoDetails,
-      audioFormats: audioFormats
+      videoDetails: {
+        videoId: info.videoDetails.videoId,
+        title: info.videoDetails.title,
+        lengthSeconds: info.videoDetails.lengthSeconds,
+        author: info.videoDetails.author?.name || null,
+        isPrivate: info.videoDetails.isPrivate,
+        isLiveContent: info.videoDetails.isLiveContent
+      },
+      recommendedFormat,
+      audioFormats: allAudioFormats
     });
   } catch (error) {
-    console.error(error);
+    console.error("MP3 info error:", error.message);
     if (error.message?.includes('sign in')) {
-      res.status(401).json({ error: "Authentication required. Please check your cookies.txt file." });
+      res.status(401).json({ error: "Authentication required" });
     } else if (error.statusCode === 429) {
-      res.status(429).json({ error: "YouTube rate limit exceeded. All proxies failed." });
+      res.status(429).json({ error: "Rate limited" });
     } else {
-      res.status(500).json({ error: "Failed to fetch video streaming data", message: error.message });
+      res.status(500).json({ error: "Failed to fetch audio data" });
     }
   }
 });
 
-// Stream endpoint
+// Optimized streaming endpoint
 app.get("/stream/:videoId", async (req, res) => {
-  try {
-    const videoId = req.params.videoId;
-    if (!videoId) {
-      return res.status(400).json({ error: "Missing video ID" });
-    }
+  const videoId = req.params.videoId;
+  if (!videoId) {
+    return res.status(400).json({ error: "Missing video ID" });
+  }
 
-    // Get info with caching to find the best audio format
+  try {
+    // Use caching for format info
     const info = await getCachedVideoInfo(videoId);
-    
-    // Get the highest quality audio-only format
-    const audioFormat = ytdl.chooseFormat(info.formats, { 
-      quality: 'highestaudio', 
-      filter: 'audioonly' 
-    });
+    const audioFormat = getBestAudioFormat(info, videoId);
     
     if (!audioFormat) {
       return res.status(404).json({ error: "No suitable audio format found" });
@@ -297,55 +258,50 @@ app.get("/stream/:videoId", async (req, res) => {
       res.header('Content-Length', audioFormat.contentLength);
     }
     
-    // Get a fresh proxy for streaming
-    const proxy = getNextProxy();
-    const proxyAgent = createProxyAgent(proxy);
-    
-    // Options for streaming
+    // Create stream with reused options
     const options = {
+      ...getBaseOptions(),
       format: audioFormat,
-      requestOptions: {}
+      range: req.headers.range // Support range requests for seeking
     };
     
-    // Add cookies if available
-    if (cookies.length > 0) {
-      options.requestOptions.cookies = cookies;
-    }
+    // Stream directly to response
+    const stream = ytdl(`https://youtube.com/watch?v=${videoId}`, options);
     
-    // Add proxy if available
-    if (proxyAgent) {
-      // Use 'client' property instead of 'agent'
-      options.requestOptions.client = { agent: proxyAgent };
-      console.log(`Streaming using proxy: ${proxy}`);
-    }
+    // Handle errors in the stream
+    stream.on('error', (err) => {
+      console.error(`Stream error for ${videoId}:`, err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Streaming error" });
+      }
+    });
     
-    // Stream the audio
-    ytdl(`https://music.youtube.com/watch?v=${videoId}`, options).pipe(res);
+    stream.pipe(res);
     
   } catch (error) {
-    console.error(error);
+    console.error("Stream error:", error.message);
     if (error.message?.includes('sign in')) {
-      res.status(401).json({ error: "Authentication required. Please check your cookies.txt file." });
+      res.status(401).json({ error: "Authentication required" });
     } else if (error.statusCode === 429) {
-      res.status(429).json({ error: "YouTube rate limit exceeded. All proxies failed." });
+      res.status(429).json({ error: "Rate limited" });
     } else {
-      res.status(500).json({ error: "Failed to stream audio", message: error.message });
+      res.status(500).json({ error: "Failed to stream audio" });
     }
   }
 });
 
-// Initialize the server
-async function startServer() {
-  // Initial proxy list load
-  await refreshProxyList();
-  
-  // Start the server
-  app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-    console.log(`Authentication: ${cookies.length > 0 ? `${cookies.length} cookies loaded` : 'No cookies loaded'}`);
-    console.log(`Proxies: ${proxyList.length > 0 ? `${proxyList.length} proxies loaded` : 'No proxies loaded'}`);
+// Fast health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "OK", 
+    cookiesLoaded: cookies.length > 0,
+    cookieCount: cookies.length,
+    cacheSize: videoCache.size
   });
-}
+});
 
-// Start the server
-startServer();
+// Initialize the server with optimizations
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Cookies: ${cookies.length > 0 ? `${cookies.length} loaded` : 'None'}`);
+});
